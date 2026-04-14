@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atlas Graph</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; overflow: hidden; height: 100vh; }
+
+#toolbar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+  background: #161b22; border-bottom: 1px solid #30363d;
+  padding: 8px 16px; display: flex; align-items: center; gap: 12px;
+  flex-wrap: wrap;
+}
+#toolbar h1 { font-size: 16px; color: #58a6ff; white-space: nowrap; }
+#search { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 6px 10px; border-radius: 6px; width: 220px; font-size: 13px; }
+#search:focus { border-color: #58a6ff; outline: none; }
+#stats-bar { font-size: 12px; color: #8b949e; white-space: nowrap; }
+.filter-group { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.filter-group label { font-size: 11px; cursor: pointer; display: flex; align-items: center; gap: 3px; }
+.filter-group input[type=checkbox] { accent-color: #58a6ff; }
+.btn { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 4px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+.btn:hover { background: #30363d; }
+.btn.active { background: #1f6feb; border-color: #1f6feb; }
+
+#graph-container { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+#graph-container canvas { position: absolute; top: 0; left: 0; }
+#label-canvas { pointer-events: none; z-index: 1; }
+
+#detail-panel {
+  position: fixed; top: 50px; right: 0; width: 320px; max-height: calc(100vh - 50px);
+  background: #161b22; border-left: 1px solid #30363d;
+  transform: translateX(100%); transition: transform 0.2s ease;
+  overflow-y: auto; padding: 16px; z-index: 5;
+}
+#detail-panel.open { transform: translateX(0); }
+#detail-panel h2 { font-size: 14px; color: #58a6ff; margin-bottom: 8px; }
+#detail-panel .field { margin-bottom: 6px; }
+#detail-panel .field-label { font-size: 11px; color: #8b949e; text-transform: uppercase; }
+#detail-panel .field-value { font-size: 13px; word-break: break-all; }
+#detail-panel .edge-list { margin-top: 12px; }
+#detail-panel .edge-item { font-size: 12px; padding: 3px 0; cursor: pointer; color: #58a6ff; }
+#detail-panel .edge-item:hover { text-decoration: underline; }
+#detail-panel .close-btn { position: absolute; top: 8px; right: 8px; cursor: pointer; color: #8b949e; font-size: 18px; }
+
+#legend {
+  position: fixed; bottom: 12px; left: 12px; background: #161b22cc; border: 1px solid #30363d;
+  border-radius: 8px; padding: 10px 14px; font-size: 11px; z-index: 5;
+}
+#legend .item { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+#legend .dot { width: 10px; height: 10px; border-radius: 50%; }
+
+#loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 16px; color: #8b949e; z-index: 20; }
+#gpu-error { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); text-align: center; z-index: 20; max-width: 500px; }
+#gpu-error h2 { color: #f85149; margin-bottom: 12px; }
+#gpu-error p { color: #8b949e; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>Atlas Graph</h1>
+  <input id="search" type="text" placeholder="Search symbols...">
+  <span id="stats-bar"></span>
+  <div class="filter-group" id="node-filters"></div>
+  <div class="filter-group" id="edge-filters"></div>
+  <button class="btn" id="btn-reset">Reset View</button>
+  <button class="btn" id="btn-files-only">Files Only</button>
+</div>
+
+<div id="graph-container">
+  <canvas id="gpu-canvas"></canvas>
+  <canvas id="label-canvas"></canvas>
+</div>
+
+<div id="detail-panel">
+  <span class="close-btn" id="close-detail">&times;</span>
+  <div id="detail-content"></div>
+</div>
+
+<div id="legend">
+  <div class="item"><span class="dot" style="background:#4a90d9"></span> File</div>
+  <div class="item"><span class="dot" style="background:#50b83c"></span> Function</div>
+  <div class="item"><span class="dot" style="background:#f5a623"></span> Type (struct/enum/union)</div>
+  <div class="item"><span class="dot" style="background:#9b59b6"></span> Test</div>
+  <div class="item"><span class="dot" style="background:#e74c3c"></span> Variable/Field</div>
+  <div class="item"><span class="dot" style="background:#95a5a6"></span> Other</div>
+</div>
+
+<div id="loading">Loading graph...</div>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script>
+(async function() {
+  'use strict';
+
+  // ── Constants ──────────────────────────────────────────────
+  const kindColor = {
+    file: [0.29, 0.565, 0.85],
+    function: [0.314, 0.722, 0.235],
+    method: [0.314, 0.722, 0.235],
+    structure: [0.96, 0.65, 0.137],
+    enumeration: [0.96, 0.65, 0.137],
+    union_type: [0.96, 0.65, 0.137],
+    class: [0.96, 0.65, 0.137],
+    test_block: [0.608, 0.349, 0.714],
+    variable: [0.906, 0.298, 0.235],
+    field: [0.906, 0.298, 0.235],
+  };
+  const defaultColor = [0.584, 0.647, 0.651];
+
+  const edgeColors = {
+    calls:      [0.29, 0.565, 0.85],
+    imports:    [0.96, 0.65, 0.137],
+    defines:    [0.314, 0.722, 0.235],
+    contains:   [0.188, 0.212, 0.235],
+    references: [0.545, 0.58, 0.624],
+  };
+  const defaultEdgeColor = [0.282, 0.31, 0.345];
+
+  const edgeWidths = { calls: 1.2, imports: 1.0, defines: 0.8, contains: 0.5, references: 0.8 };
+
+  const kindRadius = {
+    file: 8, function: 5, method: 5, structure: 7, enumeration: 7,
+    union_type: 7, repository: 12,
+  };
+  const defaultRadius = 4;
+
+  function getColor(kind) { return kindColor[kind] || defaultColor; }
+  function getRadius(kind) { return kindRadius[kind] || defaultRadius; }
+  function getEdgeColor(kind) { return edgeColors[kind] || defaultEdgeColor; }
+  function getEdgeWidth(kind) { return edgeWidths[kind] || 0.6; }
+
+  // ── WGSL Shaders ──────────────────────────────────────────
+  const SHADER_CODE = `
+struct View {
+  pan: vec2f,
+  zoom: f32,
+  _pad0: f32,
+  resolution: vec2f,
+  _pad1: vec2f,
+};
+@group(0) @binding(0) var<uniform> view: View;
+
+// ── Node rendering ──
+struct NodeOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) fill: vec3f,
+  @location(2) opacity: f32,
+  @location(3) selected: f32,
+};
+
+@vertex fn vs_node(
+  @builtin(vertex_index) vi: u32,
+  @location(0) center: vec2f,
+  @location(1) params: vec2f,
+  @location(2) fill: vec4f,
+) -> NodeOut {
+  let quad = array(
+    vec2f(-1, -1), vec2f(1, -1), vec2f(-1, 1),
+    vec2f(-1, 1), vec2f(1, -1), vec2f(1, 1),
+  );
+  let uv = quad[vi];
+  let screen_center = center * view.zoom + view.pan;
+  let r = (params.x + 2.0) * view.zoom;
+  let screen_pos = screen_center + uv * r;
+  let clip = vec2f(
+    screen_pos.x / view.resolution.x * 2.0 - 1.0,
+    1.0 - screen_pos.y / view.resolution.y * 2.0,
+  );
+  var out: NodeOut;
+  out.pos = vec4f(clip, 0, 1);
+  out.uv = uv;
+  out.fill = fill.rgb;
+  out.opacity = params.y;
+  out.selected = fill.a;
+  return out;
+}
+
+@fragment fn fs_node(in: NodeOut) -> @location(0) vec4f {
+  if (in.opacity < 0.005) { discard; }
+  let d = length(in.uv);
+  if (d > 1.0) { discard; }
+  let aa = fwidth(d) * 1.5;
+  let alpha = smoothstep(1.0, 1.0 - aa, d);
+  let stroke_t = smoothstep(0.78, 0.78 + aa, d);
+  let stroke_col = select(
+    vec3f(0.051, 0.067, 0.09),
+    vec3f(0.345, 0.651, 1.0),
+    in.selected > 0.5
+  );
+  let sel_w = select(0.0, 0.15, in.selected > 0.5);
+  let glow_t = smoothstep(0.6 - sel_w, 0.78, d) * in.selected;
+  let color = mix(in.fill, stroke_col, max(stroke_t, glow_t * 0.3));
+  return vec4f(color, alpha * in.opacity);
+}
+
+// ── Edge + arrow rendering ──
+struct EdgeOut {
+  @builtin(position) pos: vec4f,
+  @location(0) color: vec3f,
+  @location(1) opacity: f32,
+};
+
+@vertex fn vs_edge(
+  @builtin(vertex_index) vi: u32,
+  @location(0) p0: vec2f,
+  @location(1) p1: vec2f,
+  @location(2) params: vec2f,
+  @location(3) color: vec4f,
+) -> EdgeOut {
+  let s0 = p0 * view.zoom + view.pan;
+  let s1 = p1 * view.zoom + view.pan;
+  let delta = s1 - s0;
+  let len = length(delta);
+
+  var screen_pos: vec2f;
+
+  if (len < 0.5) {
+    screen_pos = vec2f(-9999.0, -9999.0);
+  } else {
+    let dir = delta / len;
+    let normal = vec2f(-dir.y, dir.x);
+
+    if (vi < 6u) {
+      let quad = array(
+        vec2f(0, -0.5), vec2f(1, -0.5), vec2f(0, 0.5),
+        vec2f(0, 0.5), vec2f(1, -0.5), vec2f(1, 0.5),
+      );
+      let q = quad[vi];
+      screen_pos = s0 + dir * q.x * len + normal * q.y * params.x;
+    } else {
+      let arrow_len = 7.0;
+      let arrow_w = 3.5;
+      let tip = s1 - dir * 8.0;
+      let tri = array(
+        tip,
+        tip - dir * arrow_len + normal * arrow_w,
+        tip - dir * arrow_len - normal * arrow_w,
+      );
+      screen_pos = tri[vi - 6u];
+    }
+  }
+
+  let clip = vec2f(
+    screen_pos.x / view.resolution.x * 2.0 - 1.0,
+    1.0 - screen_pos.y / view.resolution.y * 2.0,
+  );
+  var out: EdgeOut;
+  out.pos = vec4f(clip, 0, 1);
+  out.color = color.rgb;
+  out.opacity = params.y;
+  return out;
+}
+
+@fragment fn fs_edge(in: EdgeOut) -> @location(0) vec4f {
+  if (in.opacity < 0.005) { discard; }
+  return vec4f(in.color, in.opacity);
+}
+`;
+
+  // ── State ─────────────────────────────────────────────────
+  let allNodes = [], allEdges = [], links = [];
+  let nodeIndex = new Map();
+  let simulation;
+  let selectedNodeId = null;
+  let visibleNodeKinds = new Set();
+  let visibleEdgeKinds = new Set();
+  let filesOnlyMode = false;
+  let highlightedSet = null; // Set of node IDs to highlight, or null
+
+  // View transform (CSS pixels)
+  let panX = 0, panY = 0, zoomLevel = 1;
+  let cssWidth = window.innerWidth, cssHeight = window.innerHeight;
+
+  // Mouse state
+  let mouseDownPos = null, lastMouseX = 0, lastMouseY = 0;
+  let dragTarget = null, isDragging = false;
+  let lastHoveredId = null;
+  let hoverDwellTimer = null;
+  const HOVER_DWELL_MS = 150;
+
+  // Per-node/edge opacity lerp targets (smooth transitions)
+  let nodeOpacity = null;  // Float32Array, current interpolated values
+  let edgeOpacity = null;
+  const LERP_SPEED = 0.18; // per frame blend factor (0=frozen, 1=instant)
+
+  // GPU objects
+  let device, context, canvasFormat;
+  let gpuCanvas, labelCanvas, labelCtx;
+  let viewBuffer, viewBindGroup;
+  let nodePipeline, edgePipeline;
+  let nodeBuffer, edgeBuffer;
+  let nodeCount = 0, edgeCount = 0;
+  let msaaTexture = null;
+  const MSAA_SAMPLES = 4;
+
+  const NODE_FLOATS = 8;  // center(2) + params(2) + fill(4)
+  const EDGE_FLOATS = 10; // p0(2) + p1(2) + params(2) + color(4)
+
+  // ── WebGPU Init ───────────────────────────────────────────
+  async function initGPU() {
+    if (!navigator.gpu) {
+      throw new Error('WebGPU is not supported in this browser. Use Chrome 113+, Edge 113+, or Firefox 121+.');
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error('No WebGPU adapter found.');
+    device = await adapter.requestDevice();
+
+    gpuCanvas = document.getElementById('gpu-canvas');
+    labelCanvas = document.getElementById('label-canvas');
+    labelCtx = labelCanvas.getContext('2d');
+
+    context = gpuCanvas.getContext('webgpu');
+    canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+
+    resizeCanvases();
+
+    // Shader module
+    const shaderModule = device.createShaderModule({ code: SHADER_CODE });
+
+    // Bind group layout
+    const viewBGLayout = device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+    });
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [viewBGLayout] });
+
+    // View uniform buffer (32 bytes)
+    viewBuffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    viewBindGroup = device.createBindGroup({
+      layout: viewBGLayout,
+      entries: [{ binding: 0, resource: { buffer: viewBuffer } }],
+    });
+
+    // Node pipeline
+    const blendState = {
+      color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+      alpha: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+    };
+
+    nodePipeline = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: {
+        module: shaderModule, entryPoint: 'vs_node',
+        buffers: [{
+          arrayStride: NODE_FLOATS * 4, stepMode: 'instance',
+          attributes: [
+            { format: 'float32x2', offset: 0, shaderLocation: 0 },
+            { format: 'float32x2', offset: 8, shaderLocation: 1 },
+            { format: 'float32x4', offset: 16, shaderLocation: 2 },
+          ],
+        }],
+      },
+      fragment: {
+        module: shaderModule, entryPoint: 'fs_node',
+        targets: [{ format: canvasFormat, blend: blendState }],
+      },
+      primitive: { topology: 'triangle-list' },
+      multisample: { count: MSAA_SAMPLES },
+    });
+
+    // Edge pipeline (6 verts for line quad + 3 verts for arrow = 9 per instance)
+    edgePipeline = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: {
+        module: shaderModule, entryPoint: 'vs_edge',
+        buffers: [{
+          arrayStride: EDGE_FLOATS * 4, stepMode: 'instance',
+          attributes: [
+            { format: 'float32x2', offset: 0, shaderLocation: 0 },
+            { format: 'float32x2', offset: 8, shaderLocation: 1 },
+            { format: 'float32x2', offset: 16, shaderLocation: 2 },
+            { format: 'float32x4', offset: 24, shaderLocation: 3 },
+          ],
+        }],
+      },
+      fragment: {
+        module: shaderModule, entryPoint: 'fs_edge',
+        targets: [{ format: canvasFormat, blend: blendState }],
+      },
+      primitive: { topology: 'triangle-list' },
+      multisample: { count: MSAA_SAMPLES },
+    });
+  }
+
+  function resizeCanvases() {
+    cssWidth = window.innerWidth;
+    cssHeight = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    const pw = Math.floor(cssWidth * dpr);
+    const ph = Math.floor(cssHeight * dpr);
+
+    gpuCanvas.width = pw;
+    gpuCanvas.height = ph;
+    gpuCanvas.style.width = cssWidth + 'px';
+    gpuCanvas.style.height = cssHeight + 'px';
+
+    labelCanvas.width = pw;
+    labelCanvas.height = ph;
+    labelCanvas.style.width = cssWidth + 'px';
+    labelCanvas.style.height = cssHeight + 'px';
+    labelCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Recreate MSAA texture
+    if (msaaTexture) msaaTexture.destroy();
+    msaaTexture = device.createTexture({
+      size: [pw, ph],
+      sampleCount: MSAA_SAMPLES,
+      format: canvasFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+
+    context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+  }
+
+  // ── Buffer Management ─────────────────────────────────────
+  function createBuffers() {
+    nodeCount = allNodes.length;
+    edgeCount = links.length;
+
+    if (nodeBuffer) nodeBuffer.destroy();
+    if (edgeBuffer) edgeBuffer.destroy();
+
+    nodeBuffer = device.createBuffer({
+      size: Math.max(nodeCount * NODE_FLOATS * 4, 16),
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    edgeBuffer = device.createBuffer({
+      size: Math.max(edgeCount * EDGE_FLOATS * 4, 16),
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  function uploadNodeData() {
+    if (nodeCount === 0) return;
+    if (!nodeOpacity || nodeOpacity.length !== nodeCount) {
+      nodeOpacity = new Float32Array(nodeCount);
+      nodeOpacity.fill(1);
+    }
+    const data = new Float32Array(nodeCount * NODE_FLOATS);
+    for (let i = 0; i < nodeCount; i++) {
+      const n = allNodes[i];
+      const off = i * NODE_FLOATS;
+      data[off] = n.x || 0;
+      data[off + 1] = n.y || 0;
+      data[off + 2] = getRadius(n.kind);
+
+      // Target opacity: hidden=0, dimmed=0.1, normal=1
+      let target = 1;
+      if (!n._visible) target = 0;
+      else if (highlightedSet && !highlightedSet.has(n.id)) target = 0.1;
+
+      // Lerp toward target
+      nodeOpacity[i] += (target - nodeOpacity[i]) * LERP_SPEED;
+      // Snap when very close to avoid perpetual tiny updates
+      if (Math.abs(nodeOpacity[i] - target) < 0.01) nodeOpacity[i] = target;
+      data[off + 3] = nodeOpacity[i];
+
+      const c = getColor(n.kind);
+      data[off + 4] = c[0];
+      data[off + 5] = c[1];
+      data[off + 6] = c[2];
+      data[off + 7] = n.id === selectedNodeId ? 1 : 0;
+    }
+    device.queue.writeBuffer(nodeBuffer, 0, data);
+  }
+
+  function uploadEdgeData() {
+    if (edgeCount === 0) return;
+    if (!edgeOpacity || edgeOpacity.length !== edgeCount) {
+      edgeOpacity = new Float32Array(edgeCount);
+      edgeOpacity.fill(0.6);
+    }
+    const data = new Float32Array(edgeCount * EDGE_FLOATS);
+    for (let i = 0; i < edgeCount; i++) {
+      const e = links[i];
+      const src = e.source, dst = e.target;
+      const off = i * EDGE_FLOATS;
+      data[off] = src.x || 0;
+      data[off + 1] = src.y || 0;
+      data[off + 2] = dst.x || 0;
+      data[off + 3] = dst.y || 0;
+      data[off + 4] = getEdgeWidth(e.kind);
+
+      // Target opacity
+      let target = 0.6;
+      if (!src._visible || !dst._visible || !visibleEdgeKinds.has(e.kind)) target = 0;
+      else if (highlightedSet) {
+        const sid = src.id, tid = dst.id;
+        target = (highlightedSet.has(sid) && highlightedSet.has(tid)) ? 0.8 : 0.03;
+      }
+
+      edgeOpacity[i] += (target - edgeOpacity[i]) * LERP_SPEED;
+      if (Math.abs(edgeOpacity[i] - target) < 0.01) edgeOpacity[i] = target;
+      data[off + 5] = edgeOpacity[i];
+
+      const c = getEdgeColor(e.kind);
+      data[off + 6] = c[0];
+      data[off + 7] = c[1];
+      data[off + 8] = c[2];
+      data[off + 9] = 0;
+    }
+    device.queue.writeBuffer(edgeBuffer, 0, data);
+  }
+
+  function updateViewUniform() {
+    device.queue.writeBuffer(viewBuffer, 0, new Float32Array([
+      panX, panY, zoomLevel, 0, cssWidth, cssHeight, 0, 0,
+    ]));
+  }
+
+  // ── Render Loop ───────────────────────────────────────────
+  function render() {
+    uploadNodeData();
+    uploadEdgeData();
+    updateViewUniform();
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: msaaTexture.createView(),
+        resolveTarget: context.getCurrentTexture().createView(),
+        clearValue: { r: 0.051, g: 0.067, b: 0.09, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'discard',
+      }],
+    });
+
+    // Draw edges (with arrows) first, then nodes on top
+    if (edgeCount > 0) {
+      pass.setPipeline(edgePipeline);
+      pass.setBindGroup(0, viewBindGroup);
+      pass.setVertexBuffer(0, edgeBuffer);
+      pass.draw(9, edgeCount); // 6 (quad) + 3 (arrow) per instance
+    }
+
+    if (nodeCount > 0) {
+      pass.setPipeline(nodePipeline);
+      pass.setBindGroup(0, viewBindGroup);
+      pass.setVertexBuffer(0, nodeBuffer);
+      pass.draw(6, nodeCount);
+    }
+
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    renderLabels();
+    requestAnimationFrame(render);
+  }
+
+  function renderLabels() {
+    labelCtx.clearRect(0, 0, cssWidth, cssHeight);
+    if (zoomLevel < 0.15) return;
+
+    const showAll = zoomLevel >= 1.5;
+    labelCtx.textAlign = 'center';
+    labelCtx.textBaseline = 'top';
+
+    for (const n of allNodes) {
+      if (!n._visible) continue;
+      if (!showAll && n.kind !== 'file' && n.kind !== 'repository' && n.kind !== 'directory') continue;
+      if (highlightedSet && !highlightedSet.has(n.id)) continue;
+
+      const sx = (n.x || 0) * zoomLevel + panX;
+      const sy = (n.y || 0) * zoomLevel + panY;
+      if (sx < -100 || sx > cssWidth + 100 || sy < -50 || sy > cssHeight + 50) continue;
+
+      const fontSize = Math.max(8, Math.min(12, 10 * zoomLevel));
+      labelCtx.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+
+      // Dark background for readability
+      const text = n.name;
+      const tw = labelCtx.measureText(text).width;
+      const tx = sx;
+      const ty = sy + (getRadius(n.kind) + 2) * zoomLevel + 2;
+
+      labelCtx.fillStyle = 'rgba(13,17,23,0.75)';
+      labelCtx.fillRect(tx - tw / 2 - 2, ty - 1, tw + 4, fontSize + 2);
+
+      labelCtx.fillStyle = n.id === selectedNodeId ? '#58a6ff' : '#8b949e';
+      labelCtx.fillText(text, tx, ty);
+    }
+  }
+
+  // ── Force Simulation ──────────────────────────────────────
+  function buildSimulation() {
+    nodeIndex = new Map(allNodes.map(n => [n.id, n]));
+
+    links = allEdges.map(e => ({
+      ...e,
+      source: nodeIndex.get(e.src_id),
+      target: nodeIndex.get(e.dst_id),
+    })).filter(e => e.source && e.target);
+
+    simulation = d3.forceSimulation(allNodes)
+      .force('link', d3.forceLink(links).id(d => d.id).distance(60))
+      .force('charge', d3.forceManyBody().strength(-150))
+      .force('center', d3.forceCenter(0, 0))
+      .force('collide', d3.forceCollide().radius(d => getRadius(d.kind) + 4));
+
+    if (allNodes.length > 300) {
+      simulation.alphaDecay(0.05);
+    }
+
+    // Center view on graph
+    panX = cssWidth / 2;
+    panY = cssHeight / 2;
+  }
+
+  // ── Hit Testing ───────────────────────────────────────────
+  function screenToGraph(sx, sy) {
+    return [(sx - panX) / zoomLevel, (sy - panY) / zoomLevel];
+  }
+
+  function findNodeAt(sx, sy) {
+    const [gx, gy] = screenToGraph(sx, sy);
+    let best = null, bestDist = Infinity;
+    for (const n of allNodes) {
+      if (!n._visible) continue;
+      const dx = (n.x || 0) - gx, dy = (n.y || 0) - gy;
+      const d2 = dx * dx + dy * dy;
+      const r = getRadius(n.kind) + 3;
+      if (d2 < r * r && d2 < bestDist) {
+        best = n;
+        bestDist = d2;
+      }
+    }
+    return best;
+  }
+
+  // ── Mouse Interaction ─────────────────────────────────────
+  function setupInteraction() {
+    const canvas = gpuCanvas;
+
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const factor = e.deltaY > 0 ? 0.92 : 1.08;
+      const mx = e.offsetX, my = e.offsetY;
+      panX = mx - (mx - panX) * factor;
+      panY = my - (my - panY) * factor;
+      zoomLevel *= factor;
+    }, { passive: false });
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      clearTimeout(hoverDwellTimer);
+      hoverDwellTimer = null;
+      mouseDownPos = { x: e.offsetX, y: e.offsetY };
+      lastMouseX = e.offsetX;
+      lastMouseY = e.offsetY;
+      isDragging = false;
+      dragTarget = findNodeAt(e.offsetX, e.offsetY);
+      if (dragTarget) {
+        // Lock highlight to this node immediately (no dwell needed for clicks)
+        highlightNeighbors(dragTarget);
+        dragTarget.fx = dragTarget.x;
+        dragTarget.fy = dragTarget.y;
+        simulation.alphaTarget(0.3).restart();
+      }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (mouseDownPos) {
+        const dx = e.offsetX - mouseDownPos.x;
+        const dy = e.offsetY - mouseDownPos.y;
+        if (!isDragging && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+          isDragging = true;
+          // When starting a pan (not on a node), clear highlight to avoid flicker
+          if (!dragTarget) clearHighlight();
+        }
+
+        if (isDragging) {
+          if (dragTarget) {
+            const [gx, gy] = screenToGraph(e.offsetX, e.offsetY);
+            dragTarget.fx = gx;
+            dragTarget.fy = gy;
+          } else {
+            panX += e.offsetX - lastMouseX;
+            panY += e.offsetY - lastMouseY;
+          }
+        }
+        lastMouseX = e.offsetX;
+        lastMouseY = e.offsetY;
+      } else {
+        // Hover with dwell delay — only highlight after mouse rests on a node
+        const node = findNodeAt(e.offsetX, e.offsetY);
+        const hoveredId = node ? node.id : null;
+        canvas.style.cursor = node ? 'pointer' : 'default';
+        if (hoveredId !== lastHoveredId) {
+          lastHoveredId = hoveredId;
+          clearTimeout(hoverDwellTimer);
+          hoverDwellTimer = null;
+          if (node) {
+            // Start dwell timer — highlight only fires after mouse stays
+            hoverDwellTimer = setTimeout(() => {
+              highlightNeighbors(node);
+            }, HOVER_DWELL_MS);
+          } else {
+            clearHighlight();
+          }
+        }
+      }
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      if (mouseDownPos && !isDragging) {
+        if (dragTarget) {
+          // Keep highlight locked during the async selectNode
+          selectNode(dragTarget);
+        } else {
+          // Click on empty - deselect
+          selectedNodeId = null;
+          clearHighlight();
+          document.getElementById('detail-panel').classList.remove('open');
+        }
+      } else {
+        // Finished dragging — clear highlight unless we're still over a node
+        const node = findNodeAt(e.offsetX, e.offsetY);
+        if (node) {
+          highlightNeighbors(node);
+          lastHoveredId = node.id;
+        } else {
+          clearHighlight();
+          lastHoveredId = null;
+        }
+      }
+      if (dragTarget) {
+        dragTarget.fx = null;
+        dragTarget.fy = null;
+        simulation.alphaTarget(0);
+      }
+      mouseDownPos = null;
+      dragTarget = null;
+      isDragging = false;
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+      clearTimeout(hoverDwellTimer);
+      hoverDwellTimer = null;
+      if (!mouseDownPos) { clearHighlight(); lastHoveredId = null; }
+    });
+
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  // ── Highlight ─────────────────────────────────────────────
+  function highlightNeighbors(node) {
+    const connected = new Set([node.id]);
+    for (const l of links) {
+      const sid = l.source.id || l.source;
+      const tid = l.target.id || l.target;
+      if (sid === node.id) connected.add(tid);
+      if (tid === node.id) connected.add(sid);
+    }
+    highlightedSet = connected;
+  }
+
+  function clearHighlight() {
+    highlightedSet = null;
+  }
+
+  // ── Node Selection / Detail Panel ─────────────────────────
+  async function selectNode(d) {
+    selectedNodeId = d.id;
+    const panel = document.getElementById('detail-panel');
+    const content = document.getElementById('detail-content');
+
+    const edgeData = await fetch(`/api/edges?id=${encodeURIComponent(d.id)}`).then(r => r.json());
+
+    let html = `<h2>${escHtml(d.name)}</h2>`;
+    html += field('ID', d.id);
+    html += field('Kind', d.kind);
+    html += field('Language', d.lang);
+    html += field('Path', d.path);
+    if (d.start_line > 0) html += field('Lines', `${d.start_line} - ${d.end_line}`);
+
+    if (edgeData.outgoing && edgeData.outgoing.length > 0) {
+      html += `<div class="edge-list"><h2>Outgoing (${edgeData.outgoing.length})</h2>`;
+      edgeData.outgoing.forEach(e => {
+        html += `<div class="edge-item" data-id="${escAttr(e.dst_id)}">--${escHtml(e.kind)}--> ${escHtml(e.dst_id)}</div>`;
+      });
+      html += '</div>';
+    }
+    if (edgeData.incoming && edgeData.incoming.length > 0) {
+      html += `<div class="edge-list"><h2>Incoming (${edgeData.incoming.length})</h2>`;
+      edgeData.incoming.forEach(e => {
+        html += `<div class="edge-item" data-id="${escAttr(e.src_id)}">&lt;--${escHtml(e.kind)}-- ${escHtml(e.src_id)}</div>`;
+      });
+      html += '</div>';
+    }
+
+    content.innerHTML = html;
+    panel.classList.add('open');
+
+    content.querySelectorAll('.edge-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const targetNode = nodeIndex.get(el.dataset.id);
+        if (targetNode) selectNode(targetNode);
+      });
+    });
+  }
+
+  function field(label, value) {
+    return `<div class="field"><div class="field-label">${label}</div><div class="field-value">${escHtml(String(value))}</div></div>`;
+  }
+
+  // ── Visibility / Filters ──────────────────────────────────
+  function updateVisibility() {
+    for (const n of allNodes) {
+      n._visible = visibleNodeKinds.has(n.kind);
+    }
+  }
+
+  function buildFilters(nodeKinds, edgeKinds) {
+    const nf = document.getElementById('node-filters');
+    const hexColors = {
+      file: '#4a90d9', function: '#50b83c', method: '#50b83c',
+      structure: '#f5a623', enumeration: '#f5a623', union_type: '#f5a623', class: '#f5a623',
+      test_block: '#9b59b6', variable: '#e74c3c', field: '#e74c3c',
+    };
+
+    nodeKinds.forEach(k => {
+      const lbl = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = true; cb.dataset.kind = k;
+      cb.addEventListener('change', () => {
+        if (cb.checked) visibleNodeKinds.add(k); else visibleNodeKinds.delete(k);
+        filesOnlyMode = false;
+        document.getElementById('btn-files-only').classList.remove('active');
+        updateVisibility();
+      });
+      lbl.appendChild(cb);
+      lbl.appendChild(document.createTextNode(k));
+      lbl.style.color = hexColors[k] || '#bdc3c7';
+      nf.appendChild(lbl);
+    });
+
+    const ef = document.getElementById('edge-filters');
+    const edgeHexColors = { calls: '#4a90d9', imports: '#f5a623', defines: '#50b83c', contains: '#30363d', references: '#8b949e' };
+    edgeKinds.forEach(k => {
+      const lbl = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = true; cb.dataset.kind = k;
+      cb.addEventListener('change', () => {
+        if (cb.checked) visibleEdgeKinds.add(k); else visibleEdgeKinds.delete(k);
+      });
+      lbl.appendChild(cb);
+      lbl.appendChild(document.createTextNode(k));
+      lbl.style.color = edgeHexColors[k] || '#484f58';
+      ef.appendChild(lbl);
+    });
+  }
+
+  // ── Search ────────────────────────────────────────────────
+  let searchTimeout;
+  function setupSearch() {
+    const searchInput = document.getElementById('search');
+    searchInput.addEventListener('input', function() {
+      clearTimeout(searchTimeout);
+      const q = this.value.trim();
+      if (!q) { clearHighlight(); return; }
+
+      searchTimeout = setTimeout(async () => {
+        const results = await fetch(`/api/nodes?q=${encodeURIComponent(q)}`).then(r => r.json());
+        const ids = new Set(results.map(r => r.id));
+        if (ids.size === 0) { clearHighlight(); return; }
+        highlightedSet = ids;
+
+        // Zoom to first result
+        const first = allNodes.find(n => ids.has(n.id));
+        if (first && first.x != null) {
+          panX = cssWidth / 2 - first.x * zoomLevel;
+          panY = cssHeight / 2 - first.y * zoomLevel;
+        }
+      }, 300);
+    });
+
+    searchInput.addEventListener('blur', function() {
+      if (!this.value.trim()) clearHighlight();
+    });
+  }
+
+  // ── Toolbar Buttons ───────────────────────────────────────
+  function setupToolbar() {
+    document.getElementById('btn-reset').addEventListener('click', () => {
+      panX = cssWidth / 2;
+      panY = cssHeight / 2;
+      zoomLevel = 1;
+    });
+
+    document.getElementById('btn-files-only').addEventListener('click', function() {
+      filesOnlyMode = !filesOnlyMode;
+      this.classList.toggle('active', filesOnlyMode);
+      if (filesOnlyMode) {
+        visibleNodeKinds.clear();
+        visibleNodeKinds.add('file');
+        visibleNodeKinds.add('repository');
+        visibleNodeKinds.add('directory');
+      } else {
+        [...new Set(allNodes.map(n => n.kind))].forEach(k => visibleNodeKinds.add(k));
+      }
+      document.querySelectorAll('#node-filters input').forEach(cb => {
+        cb.checked = visibleNodeKinds.has(cb.dataset.kind);
+      });
+      updateVisibility();
+    });
+
+    document.getElementById('close-detail').addEventListener('click', () => {
+      document.getElementById('detail-panel').classList.remove('open');
+      selectedNodeId = null;
+    });
+  }
+
+  // ── Resize ────────────────────────────────────────────────
+  window.addEventListener('resize', () => {
+    if (device) resizeCanvases();
+  });
+
+  // ── HTML Helpers ──────────────────────────────────────────
+  function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  function escAttr(s) { return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  // ── Main Init ─────────────────────────────────────────────
+  try {
+    await initGPU();
+
+    const [stats, graph] = await Promise.all([
+      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/graph').then(r => r.json()),
+    ]);
+
+    document.getElementById('loading').remove();
+
+    document.getElementById('stats-bar').textContent =
+      `${stats.total_nodes} nodes, ${stats.total_edges} edges | ` +
+      `${stats.files} files, ${stats.functions} functions, ${stats.structures} types, ${stats.tests} tests | ` +
+      `${stats.imports_edges} imports, ${stats.calls_edges} calls`;
+
+    allNodes = graph.nodes;
+    allEdges = graph.edges;
+    allNodes.forEach(n => n._visible = true);
+
+    const nodeKinds = [...new Set(allNodes.map(n => n.kind))].sort();
+    const edgeKinds = [...new Set(allEdges.map(e => e.kind))].sort();
+    nodeKinds.forEach(k => visibleNodeKinds.add(k));
+    edgeKinds.forEach(k => visibleEdgeKinds.add(k));
+
+    buildFilters(nodeKinds, edgeKinds);
+    buildSimulation();
+    createBuffers();
+    setupInteraction();
+    setupSearch();
+    setupToolbar();
+
+    // Start in files-only mode for large graphs
+    if (allNodes.length > 500) {
+      document.getElementById('btn-files-only').click();
+    }
+
+    requestAnimationFrame(render);
+
+  } catch (err) {
+    const loading = document.getElementById('loading');
+    if (loading) loading.remove();
+
+    document.getElementById('graph-container').innerHTML = '';
+    const errDiv = document.createElement('div');
+    errDiv.id = 'gpu-error';
+    errDiv.innerHTML = `<h2>WebGPU Not Available</h2><p>${escHtml(err.message)}</p>
+      <p style="margin-top:16px">WebGPU requires a modern browser:<br>Chrome 113+, Edge 113+, or Firefox 121+</p>`;
+    document.body.appendChild(errDiv);
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>

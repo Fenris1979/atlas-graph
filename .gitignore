@@ -1,0 +1,18 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Atlas Graph local database
+.atlas-graph/
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.vscode/
+*.swp
+*~
+
+# Internal design docs (not shipped)
+architecture.md
+technical_design.md

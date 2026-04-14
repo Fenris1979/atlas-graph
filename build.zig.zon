@@ -1,0 +1,14 @@
+.{
+    .name = .atlas_graph,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .fingerprint = 0x4c568d36755aae5b,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "vendor",
+        "README.md",
+    },
+}

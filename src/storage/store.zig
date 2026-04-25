@@ -270,7 +270,7 @@ pub const Store = struct {
             \\FROM edges e
             \\JOIN nodes src ON src.id = e.src_id AND src.kind = 'file'
             \\JOIN nodes dst ON dst.id = e.dst_id
-            \\WHERE e.kind = 'imports' AND src.path LIKE ?1
+            \\WHERE e.kind IN ('imports', 'includes') AND src.path LIKE ?1
             \\ORDER BY dst.path;
         ;
         const stmt = try self.prepare(sql);
@@ -290,7 +290,7 @@ pub const Store = struct {
             \\FROM edges e
             \\JOIN nodes src ON src.id = e.src_id
             \\JOIN nodes dst ON dst.id = e.dst_id AND dst.kind = 'file'
-            \\WHERE e.kind = 'imports' AND dst.path LIKE ?1
+            \\WHERE e.kind IN ('imports', 'includes') AND dst.path LIKE ?1
             \\ORDER BY src.path;
         ;
         const stmt = try self.prepare(sql);

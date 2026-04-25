@@ -1,7 +1,11 @@
 const std = @import("std");
 const schema = @import("../graph/schema.zig");
 const Store = @import("../storage/store.zig").Store;
+const analysis_types = @import("analysis.zig");
 const zig_indexer = @import("zig_indexer.zig");
+const c_indexer = @import("c_indexer.zig");
+
+const FileAnalysis = analysis_types.FileAnalysis;
 
 pub const IndexSummary = struct {
     files_seen: usize = 0,
@@ -115,9 +119,10 @@ pub const IndexManager = struct {
             try file_paths.append(self.allocator, owned);
         }
 
-        // Classify files and collect zig paths for parallel parsing
-        var zig_paths = std.ArrayListUnmanaged([]const u8){};
-        defer zig_paths.deinit(self.allocator);
+        // Classify files and collect paths we can actually parse.
+        const ParseablePath = struct { rel_path: []const u8, lang: schema.Language };
+        var parseable_paths = std.ArrayListUnmanaged(ParseablePath){};
+        defer parseable_paths.deinit(self.allocator);
 
         for (file_paths.items) |rel_path| {
             const lang = schema.languageFromPath(rel_path);
@@ -125,22 +130,26 @@ pub const IndexManager = struct {
             switch (lang) {
                 .zig => {
                     summary.zig_files += 1;
-                    try zig_paths.append(self.allocator, rel_path);
+                    try parseable_paths.append(self.allocator, .{ .rel_path = rel_path, .lang = .zig });
                 },
-                .c, .cpp, .objc => summary.c_family_files += 1,
+                .c => {
+                    summary.c_family_files += 1;
+                    try parseable_paths.append(self.allocator, .{ .rel_path = rel_path, .lang = .c });
+                },
+                .cpp, .objc => summary.c_family_files += 1,
                 .unknown => summary.other_files += 1,
             }
         }
 
-        // Parallel phase: read + parse all zig files on thread pool
+        // Parallel phase: read + parse all parseable files on thread pool
 
         const ParseResult = struct {
-            analysis: ?zig_indexer.FileAnalysis = null,
+            analysis: ?FileAnalysis = null,
             source: ?[:0]u8 = null,
             failed: bool = false,
         };
 
-        const parse_results = try self.allocator.alloc(ParseResult, zig_paths.items.len);
+        const parse_results = try self.allocator.alloc(ParseResult, parseable_paths.items.len);
         defer self.allocator.free(parse_results);
         @memset(parse_results, .{});
 
@@ -156,25 +165,29 @@ pub const IndexManager = struct {
 
         const ParseContext = struct {
             alloc: std.mem.Allocator,
-            zig_paths: []const []const u8,
+            paths: []const ParseablePath,
             parse_results: []ParseResult,
             repo_dir_path: []const u8,
 
             fn worker(ctx: @This(), start: usize, end: usize) void {
                 for (start..end) |i| {
-                    ctx.parse_results[i] = parseOneFile(ctx.alloc, ctx.repo_dir_path, ctx.zig_paths[i]);
+                    ctx.parse_results[i] = parseOneFile(ctx.alloc, ctx.repo_dir_path, ctx.paths[i]);
                 }
             }
 
-            fn parseOneFile(alloc: std.mem.Allocator, base_path: []const u8, rel_path: []const u8) ParseResult {
-                const full_path = std.fs.path.join(alloc, &.{ base_path, rel_path }) catch return .{ .failed = true };
+            fn parseOneFile(alloc: std.mem.Allocator, base_path: []const u8, entry: ParseablePath) ParseResult {
+                const full_path = std.fs.path.join(alloc, &.{ base_path, entry.rel_path }) catch return .{ .failed = true };
                 defer alloc.free(full_path);
 
                 const file = std.fs.cwd().openFile(full_path, .{}) catch return .{ .failed = true };
                 defer file.close();
 
                 const source = file.readToEndAllocOptions(alloc, 10 * 1024 * 1024, null, .@"1", 0) catch return .{ .failed = true };
-                const analysis = zig_indexer.analyzeSource(alloc, source) catch {
+                const analysis = switch (entry.lang) {
+                    .zig => zig_indexer.analyzeSource(alloc, source),
+                    .c => c_indexer.analyzeSource(alloc, source),
+                    else => unreachable,
+                } catch {
                     alloc.free(source);
                     return .{ .failed = true };
                 };
@@ -185,20 +198,20 @@ pub const IndexManager = struct {
 
         const ctx = ParseContext{
             .alloc = ts_alloc,
-            .zig_paths = zig_paths.items,
+            .paths = parseable_paths.items,
             .parse_results = parse_results,
             .repo_dir_path = repo_dir_path,
         };
 
         // Spawn worker threads
-        const num_threads = @min(zig_paths.items.len, 8);
+        const num_threads = @min(parseable_paths.items.len, 8);
         if (num_threads > 1) {
-            const chunk_size = zig_paths.items.len / num_threads;
+            const chunk_size = parseable_paths.items.len / num_threads;
             var threads: [8]?std.Thread = .{null} ** 8;
 
             for (0..num_threads) |t| {
                 const start = t * chunk_size;
-                const end = if (t == num_threads - 1) zig_paths.items.len else (t + 1) * chunk_size;
+                const end = if (t == num_threads - 1) parseable_paths.items.len else (t + 1) * chunk_size;
                 threads[t] = std.Thread.spawn(.{}, ParseContext.worker, .{ ctx, start, end }) catch null;
             }
             for (&threads) |*t| {
@@ -208,7 +221,7 @@ pub const IndexManager = struct {
                 }
             }
         } else {
-            ctx.worker(0, zig_paths.items.len);
+            ctx.worker(0, parseable_paths.items.len);
         }
 
         // Sequential phase: insert all nodes into SQLite + build index
@@ -218,7 +231,7 @@ pub const IndexManager = struct {
         const FileInfo = struct {
             rel_path: []const u8,
             file_id: []u8,
-            analysis: ?zig_indexer.FileAnalysis,
+            analysis: ?FileAnalysis,
             source: ?[:0]u8,
         };
         var file_infos = std.ArrayListUnmanaged(FileInfo){};
@@ -266,14 +279,17 @@ pub const IndexManager = struct {
             });
         }
 
-        // Insert symbol nodes from parallel parse results
-        var zig_idx: usize = 0;
+        // Insert symbol nodes from parallel parse results.
+        // parse_results is indexed in the same order as parseable_paths; walk
+        // file_infos and advance parse_idx whenever the file's language is
+        // one we parse (currently .zig or .c).
+        var parse_idx: usize = 0;
         for (file_infos.items) |*info| {
             const lang = schema.languageFromPath(info.rel_path);
-            if (lang != .zig) continue;
+            if (lang != .zig and lang != .c) continue;
 
-            const pr = &parse_results[zig_idx];
-            zig_idx += 1;
+            const pr = &parse_results[parse_idx];
+            parse_idx += 1;
 
             if (pr.failed or pr.analysis == null) continue;
 
@@ -291,7 +307,7 @@ pub const IndexManager = struct {
                 try store.insertNode(.{
                     .id = sym_id,
                     .kind = sym.kind,
-                    .lang = .zig,
+                    .lang = lang,
                     .name = sym.name,
                     .path = info.rel_path,
                     .start_line = sym.start_line,
@@ -336,7 +352,7 @@ pub const IndexManager = struct {
         _: *IndexManager,
         rel_path: []const u8,
         file_id: []const u8,
-        analysis: zig_indexer.FileAnalysis,
+        analysis: FileAnalysis,
         store: *Store,
         summary: *IndexSummary,
         node_index: *const NodeIndex,
@@ -345,9 +361,20 @@ pub const IndexManager = struct {
         var id_buf2: [1024]u8 = undefined;
         var path_buf: [1024]u8 = undefined;
 
-        // Insert "imports" edges for local file imports
+        const file_lang = schema.languageFromPath(rel_path);
+        const edge_kind: schema.EdgeKind = if (file_lang == .c or file_lang == .cpp or file_lang == .objc)
+            .includes
+        else
+            .imports;
+
+        // Insert import/include edges for local file imports
         for (analysis.imports) |imp| {
-            if (std.mem.endsWith(u8, imp.path, ".zig")) {
+            const is_resolvable = std.mem.endsWith(u8, imp.path, ".zig") or
+                std.mem.endsWith(u8, imp.path, ".h") or
+                std.mem.endsWith(u8, imp.path, ".hpp") or
+                std.mem.endsWith(u8, imp.path, ".hh");
+
+            if (is_resolvable) {
                 const resolved = resolveRelativePathBuf(&path_buf, rel_path, imp.path) orelse continue;
                 const target_file_id = std.fmt.bufPrint(&id_buf, "file:{s}", .{resolved}) catch continue;
 
@@ -355,7 +382,7 @@ pub const IndexManager = struct {
                     try store.insertEdge(.{
                         .src_id = file_id,
                         .dst_id = target_file_id,
-                        .kind = .imports,
+                        .kind = edge_kind,
                     });
                     summary.edges_written += 1;
                 }
@@ -615,15 +642,15 @@ test "index manager writes file and symbol nodes to store" {
     try std.testing.expectEqual(@as(usize, 1), summary.zig_files);
     try std.testing.expectEqual(@as(usize, 1), summary.c_family_files);
     try std.testing.expectEqual(@as(usize, 1), summary.other_files);
-    // 2 source file nodes + 2 symbols (Config struct + main fn)
-    try std.testing.expectEqual(@as(usize, 4), summary.nodes_written);
-    try std.testing.expectEqual(@as(usize, 2), summary.symbols_extracted);
+    // 2 source file nodes + 3 symbols (Config struct + main fn + helper C fn)
+    try std.testing.expectEqual(@as(usize, 5), summary.nodes_written);
+    try std.testing.expectEqual(@as(usize, 3), summary.symbols_extracted);
     try std.testing.expectEqual(@as(usize, 1), summary.imports_extracted);
 
-    // 1 repo + 2 files + 2 symbols = 5 nodes
-    try std.testing.expectEqual(@as(i64, 5), try store.countNodes());
-    // 2 contains (repo->file) + 2 defines (file->symbol) = 4 edges
-    try std.testing.expectEqual(@as(i64, 4), try store.countEdges());
+    // 1 repo + 2 files + 3 symbols = 6 nodes
+    try std.testing.expectEqual(@as(i64, 6), try store.countNodes());
+    // 2 contains (repo->file) + 3 defines (file->symbol) = 5 edges
+    try std.testing.expectEqual(@as(i64, 5), try store.countEdges());
 }
 
 test "indexRepository resolves import edges between zig files" {
@@ -782,6 +809,71 @@ test "resolveRelativePathBuf normalizes parent references" {
     var buf3: [1024]u8 = undefined;
     const r3 = resolveRelativePathBuf(&buf3, "main.zig", "lib.zig").?;
     try std.testing.expectEqualStrings("lib.zig", r3);
+}
+
+test "indexRepository indexes C files and resolves #include edges" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    var repo_dir = try tmp.dir.openDir("repo", .{});
+    defer repo_dir.close();
+
+    try repo_dir.writeFile(.{
+        .sub_path = "lib.h",
+        .data =
+        \\#ifndef LIB_H
+        \\#define LIB_H
+        \\int lib_helper(int x);
+        \\#endif
+        ,
+    });
+    try repo_dir.writeFile(.{
+        .sub_path = "lib.c",
+        .data =
+        \\#include "lib.h"
+        \\int lib_helper(int x) { return x + 1; }
+        ,
+    });
+    try repo_dir.writeFile(.{
+        .sub_path = "main.c",
+        .data =
+        \\#include "lib.h"
+        \\int main(void) {
+        \\    return lib_helper(41);
+        \\}
+        ,
+    });
+
+    const repo_path = try tmp.dir.realpathAlloc(allocator, "repo");
+    defer allocator.free(repo_path);
+
+    var store = Store.init(allocator);
+    defer store.deinit();
+    try store.open(repo_path);
+
+    var mgr = IndexManager.init(allocator);
+    defer mgr.deinit();
+
+    const summary = try mgr.indexRepository(repo_path, &store);
+
+    try std.testing.expectEqual(@as(usize, 3), summary.c_family_files);
+    // lib_helper (def) + main fn in main.c + lib_helper (def) in lib.c = 3 fn symbols
+    try std.testing.expect(summary.symbols_extracted >= 2);
+
+    // main.c includes lib.h → includes edge should land
+    const imports = try store.importsOf("main.c");
+    defer store.freeNodeRows(imports);
+    try std.testing.expectEqual(@as(usize, 1), imports.len);
+    try std.testing.expectEqualStrings("lib.h", imports[0].name);
+
+    // main() calls lib_helper — with a single global match, strategy 4 resolves it
+    const callees = try store.callees("main");
+    defer store.freeNodeRows(callees);
+    try std.testing.expectEqual(@as(usize, 1), callees.len);
+    try std.testing.expectEqualStrings("lib_helper", callees[0].name);
 }
 
 test "resolveRelativePath allocating version" {

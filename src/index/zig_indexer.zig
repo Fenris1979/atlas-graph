@@ -1,54 +1,13 @@
 const std = @import("std");
 const schema = @import("../graph/schema.zig");
+const analysis_types = @import("analysis.zig");
 const Ast = std.zig.Ast;
 
-pub const ExtractedSymbol = struct {
-    name: []const u8,
-    kind: schema.NodeKind,
-    is_public: bool,
-    start_line: u32,
-    end_line: u32,
-};
-
-pub const ExtractedImport = struct {
-    /// The import path string, e.g. "std" or "../foo.zig"
-    path: []const u8,
-    /// The const name bound to the import, e.g. "std", "foo"
-    alias: []const u8,
-    line: u32,
-};
-
-pub const ExtractedCall = struct {
-    /// Name of the calling function
-    caller_name: []const u8,
-    /// Name of the called function (e.g. "init", "open", "printHelp")
-    callee_name: []const u8,
-    /// Qualifier before the callee, if any.
-    /// For Store.init() → "Store", for self.ui.printHelp() → "ui"
-    qualifier: ?[]const u8 = null,
-    line: u32,
-};
-
-pub const ExtractedField = struct {
-    /// The field name, e.g. "store", "ui"
-    name: []const u8,
-    /// The type name if it's a simple identifier, e.g. "Store", "Ui"
-    type_name: ?[]const u8,
-};
-
-pub const FileAnalysis = struct {
-    symbols: []ExtractedSymbol,
-    imports: []ExtractedImport,
-    calls: []ExtractedCall,
-    fields: []ExtractedField,
-
-    pub fn deinit(self: *FileAnalysis, allocator: std.mem.Allocator) void {
-        allocator.free(self.symbols);
-        allocator.free(self.imports);
-        allocator.free(self.calls);
-        allocator.free(self.fields);
-    }
-};
+pub const ExtractedSymbol = analysis_types.ExtractedSymbol;
+pub const ExtractedImport = analysis_types.ExtractedImport;
+pub const ExtractedCall = analysis_types.ExtractedCall;
+pub const ExtractedField = analysis_types.ExtractedField;
+pub const FileAnalysis = analysis_types.FileAnalysis;
 
 pub fn analyzeSource(allocator: std.mem.Allocator, source: [:0]const u8) !FileAnalysis {
     var tree = try Ast.parse(allocator, source, .zig);
